@@ -1,0 +1,25 @@
+# ══════════════════════════════════════════════════════════════
+#  Agentic Protein Structure Classifier — Gradio App
+#  Requirements
+# ══════════════════════════════════════════════════════════════
+
+# ── Core ML & Data ────────────────────────────────────────────
+numpy>=1.26.0
+pandas>=2.2.0
+scikit-learn>=1.4.0
+imbalanced-learn>=0.12.0        # SMOTE oversampling
+
+# ── Agentic LLM Stack ─────────────────────────────────────────
+openai>=1.30.0                  # GPT-4o API client
+langgraph>=0.1.0                # StateGraph orchestration
+langchain-core>=0.2.0           # Required by LangGraph
+
+# ── Gradio UI ─────────────────────────────────────────────────
+gradio>=4.44.0
+
+# ── Plotting (results dashboard) ──────────────────────────────
+plotly>=5.22.0
+matplotlib>=3.9.0
+
+# ── Utilities ─────────────────────────────────────────────────
+python-dotenv>=1.0.0            # Load OPENAI_API_KEY from .env
