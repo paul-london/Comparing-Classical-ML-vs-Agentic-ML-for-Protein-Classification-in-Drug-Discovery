@@ -1,37 +1,62 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  app.py  —  Gradio frontend for the Agentic Protein Structure Classifier    ║
+║  app.py  —  Protein Structure Classifier  (PREDICTION UI)                  ║
 ║                                                                             ║
-║  Features:                                                                  ║
-║    • CSV upload or path input                                               ║
-║    • Live agent log streamed to the UI                                      ║
-║    • Results dashboard: metrics cards, feature importance bar chart,        ║
-║      confusion matrix, classification reports, full agent reasoning chain   ║
-║    • Download buttons for artefacts                                         ║
+║  Loads the pre-trained model from model/ and predicts protein class         ║
+║  from whatever data the user provides.  Nothing is required —               ║
+║  the more fields filled in, the more confident the prediction.              ║
+║                                                                             ║
+║  Run:  python app.py                                                        ║
+║  Prerequisites: model/ directory must exist (run agent_core.py first)      ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
-import os
 import json
-import tempfile
-import threading
-import queue
-import traceback
 from pathlib import Path
 
 import gradio as gr
+import joblib
+import numpy as np
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from dotenv import load_dotenv
 
-from agent_core import run_pipeline
-
-load_dotenv()
+from agent_core import (
+    AMINO_ACIDS, NUMERIC_COLS,
+    extract_sequence_features,
+)
 
 # ──────────────────────────────────────────────────────────────
-#  COLOUR PALETTE  (dark scientific / bioinformatics vibe)
+#  MODEL LOADING
+# ──────────────────────────────────────────────────────────────
+MODEL_DIR = Path(__file__).parent / "model"
+
+def load_model():
+    """Load model artefacts.  Returns (model, label_encoder, feature_columns) or raises."""
+    missing = [f for f in ["rf_model.joblib", "label_encoder.joblib", "feature_columns.json"]
+               if not (MODEL_DIR / f).exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"Missing model artefacts: {missing}\n"
+            f"Run  python agent_core.py --csv your_data.csv  first."
+        )
+    model    = joblib.load(MODEL_DIR / "rf_model.joblib")
+    le       = joblib.load(MODEL_DIR / "label_encoder.joblib")
+    feat_cols = json.load(open(MODEL_DIR / "feature_columns.json"))
+    return model, le, feat_cols
+
+try:
+    MODEL, LE, FEATURE_COLS = load_model()
+    MODEL_READY = True
+    MODEL_ERROR = None
+except Exception as e:
+    MODEL, LE, FEATURE_COLS = None, None, []
+    MODEL_READY = False
+    MODEL_ERROR = str(e)
+
+TOP_N_PRED = 5   # how many top classes to show
+
+# ──────────────────────────────────────────────────────────────
+#  COLOUR PALETTE
 # ──────────────────────────────────────────────────────────────
 DEEP_NAVY   = "#0B1929"
 CARD_BG     = "#0F2238"
@@ -41,588 +66,409 @@ TEXT_LIGHT  = "#E8F4F8"
 TEXT_DIM    = "#7A9AB5"
 SUCCESS     = "#00C896"
 WARNING     = "#FFB347"
-DANGER      = "#FF6B6B"
 
 CUSTOM_CSS = f"""
-/* ── Root & body ─────────────────────────── */
-:root {{
-    --deep-navy:   {DEEP_NAVY};
-    --card-bg:     {CARD_BG};
-    --accent-teal: {ACCENT_TEAL};
-    --accent-blue: {ACCENT_BLUE};
-    --text-light:  {TEXT_LIGHT};
-    --text-dim:    {TEXT_DIM};
-}}
-
 body, .gradio-container {{
-    background: var(--deep-navy) !important;
+    background: {DEEP_NAVY} !important;
     font-family: 'IBM Plex Mono', 'Courier New', monospace;
-    color: var(--text-light) !important;
+    color: {TEXT_LIGHT} !important;
 }}
-
-/* ── Header banner ──────────────────────── */
-#header-banner {{
-    background: linear-gradient(135deg, #0B1929 0%, #0F3460 50%, #0B1929 100%);
+#header {{
+    background: linear-gradient(135deg, #0B1929 0%, #0F3460 60%, #0B1929 100%);
     border: 1px solid {ACCENT_TEAL}33;
     border-radius: 12px;
     padding: 2rem 2.5rem;
     margin-bottom: 1.5rem;
-    position: relative;
-    overflow: hidden;
+    position: relative; overflow: hidden;
 }}
-#header-banner::before {{
-    content: '';
-    position: absolute;
-    inset: 0;
-    background: repeating-linear-gradient(
-        90deg,
-        transparent,
-        transparent 60px,
-        {ACCENT_TEAL}08 60px,
-        {ACCENT_TEAL}08 61px
-    );
+#header::before {{
+    content:''; position:absolute; inset:0;
+    background: repeating-linear-gradient(90deg, transparent, transparent 60px,
+        {ACCENT_TEAL}08 60px, {ACCENT_TEAL}08 61px);
 }}
-
-/* ── Cards ──────────────────────────────── */
-.metric-card {{
-    background: var(--card-bg);
-    border: 1px solid {ACCENT_TEAL}33;
-    border-radius: 10px;
-    padding: 1.2rem 1.5rem;
-    text-align: center;
-}}
-
-/* ── Buttons ────────────────────────────── */
-#run-btn {{
+#predict-btn {{
     background: linear-gradient(135deg, {ACCENT_TEAL}, {ACCENT_BLUE}) !important;
     color: {DEEP_NAVY} !important;
     font-weight: 700 !important;
     font-size: 1rem !important;
     border-radius: 8px !important;
     border: none !important;
-    padding: 0.8rem 2rem !important;
     letter-spacing: 0.05em !important;
     transition: opacity 0.2s !important;
+    width: 100% !important;
+    padding: 0.9rem !important;
 }}
-#run-btn:hover {{ opacity: 0.85 !important; }}
-
-#dl-report-btn, #dl-fi-btn, #dl-log-btn {{
+#predict-btn:hover {{ opacity: 0.85 !important; }}
+.gr-textbox textarea, .gr-textbox input,
+.gr-number input, .gr-slider input {{
     background: {CARD_BG} !important;
-    color: {ACCENT_TEAL} !important;
-    border: 1px solid {ACCENT_TEAL}55 !important;
-    border-radius: 6px !important;
-}}
-
-/* ── Inputs & textboxes ─────────────────── */
-.gr-textbox textarea, .gr-textbox input {{
-    background: {CARD_BG} !important;
-    color: var(--text-light) !important;
+    color: {TEXT_LIGHT} !important;
     border-color: {ACCENT_TEAL}44 !important;
-    font-family: inherit !important;
-}}
-
-/* ── Tab labels ─────────────────────────── */
-.tab-nav button {{
-    color: var(--text-dim) !important;
     font-family: 'IBM Plex Mono', monospace !important;
-    letter-spacing: 0.04em !important;
 }}
-.tab-nav button.selected {{
-    color: {ACCENT_TEAL} !important;
-    border-bottom-color: {ACCENT_TEAL} !important;
-}}
-
-/* ── Log area ───────────────────────────── */
-#agent-log textarea {{
-    background: #060F18 !important;
-    color: {ACCENT_TEAL} !important;
-    font-family: 'IBM Plex Mono', monospace !important;
+.gr-number label, .gr-textbox label, .gr-slider label {{
+    color: {TEXT_DIM} !important;
     font-size: 0.78rem !important;
-    border-color: {ACCENT_TEAL}33 !important;
-    line-height: 1.6 !important;
+    letter-spacing: 0.08em !important;
 }}
-
-/* ── Section labels ─────────────────────── */
-.section-label {{
-    color: {TEXT_DIM};
-    font-size: 0.72rem;
-    letter-spacing: 0.15em;
+.section-title {{
+    color: {ACCENT_TEAL};
+    font-size: 0.7rem;
+    letter-spacing: 0.18em;
     text-transform: uppercase;
-    margin-bottom: 0.4rem;
+    border-bottom: 1px solid {ACCENT_TEAL}33;
+    padding-bottom: 0.4rem;
+    margin-bottom: 0.8rem;
+    margin-top: 1.2rem;
 }}
+.completeness-bar {{
+    height: 6px;
+    border-radius: 3px;
+    background: linear-gradient(90deg, {ACCENT_TEAL}, {ACCENT_BLUE});
+    transition: width 0.3s ease;
+}}
+.tab-nav button {{ color: {TEXT_DIM} !important; font-family: 'IBM Plex Mono' !important; }}
+.tab-nav button.selected {{ color: {ACCENT_TEAL} !important; border-bottom-color: {ACCENT_TEAL} !important; }}
 """
 
+# ──────────────────────────────────────────────────────────────
+#  FEATURE BUILDER  —  assembles a 1-row DataFrame from inputs
+# ──────────────────────────────────────────────────────────────
+def build_feature_row(
+    chain_sequences: str,
+    resolution:      float | None,
+    mol_weight:      float | None,
+    density_matt:    float | None,
+    density_sol:     float | None,
+    ph_value:        float | None,
+) -> tuple[pd.DataFrame, int, int, list[str]]:
+    """
+    Returns:
+        feature_df      — 1-row DataFrame aligned to FEATURE_COLS
+        filled_count    — how many feature groups the user provided
+        total_groups    — total possible groups (for completeness %)
+        provided_labels — human-readable list of what was provided
+    """
+    row       = {col: 0.0 for col in FEATURE_COLS}
+    provided  = []
+    filled    = 0
+    total_grp = 2   # physicochemical + sequence
+
+    # ── Physicochemical ───────────────────────────────────────
+    phys_map = {
+        "resolution":                 resolution,
+        "structure_molecular_weight": mol_weight,
+        "density_matthews":           density_matt,
+        "density_percent_sol":        density_sol,
+        "ph_value":                   ph_value,
+    }
+    phys_provided = []
+    for col, val in phys_map.items():
+        if val is not None and col in row:
+            row[col] = float(val)
+            phys_provided.append(col)
+    if phys_provided:
+        provided.append(f"Physicochemical ({len(phys_provided)}/5 fields)")
+        filled += len(phys_provided) / 5   # partial credit
+
+    # ── Sequence features ─────────────────────────────────────
+    chain_str = (chain_sequences or "").strip()
+    if chain_str:
+        seq_feats = extract_sequence_features(chain_str)
+        for k, v in seq_feats.items():
+            if k in row:
+                row[k] = v
+        total_seq = sum(v != 0 for v in seq_feats.values())
+        if total_seq > 0:
+            provided.append(f"Sequence features (27 computed from chain_sequences)")
+            filled += 1
+
+    feature_df = pd.DataFrame([row])[FEATURE_COLS]
+    return feature_df, filled, total_grp, provided
+
+
+def completeness_pct(filled: float, total: int) -> int:
+    return min(100, int(100 * filled / total))
+
 
 # ──────────────────────────────────────────────────────────────
-#  CHART BUILDERS
+#  PREDICTION CHART
 # ──────────────────────────────────────────────────────────────
-_plotly_layout = dict(
+_layout = dict(
     paper_bgcolor="rgba(0,0,0,0)",
-    plot_bgcolor="rgba(15,34,56,0.9)",
+    plot_bgcolor=f"rgba(15,34,56,0.9)",
     font=dict(color=TEXT_LIGHT, family="IBM Plex Mono, monospace"),
     margin=dict(l=10, r=10, t=40, b=10),
 )
 
-
-def build_feature_importance_chart(fi_df: pd.DataFrame) -> go.Figure:
-    top15 = fi_df.head(15).sort_values("importance")
+def build_prediction_chart(classes: list[str], probs: list[float]) -> go.Figure:
+    colours = [
+        f"rgba(0,212,180,{0.9 - i * 0.15})" for i in range(len(classes))
+    ]
     fig = go.Figure(go.Bar(
-        x=top15["importance"],
-        y=top15["feature"],
+        x=probs,
+        y=classes,
         orientation="h",
-        marker=dict(
-            color=top15["importance"],
-            colorscale=[[0, ACCENT_BLUE], [1, ACCENT_TEAL]],
-            showscale=False,
-        ),
+        marker_color=colours,
+        text=[f"{p:.1%}" for p in probs],
+        textposition="outside",
+        textfont=dict(color=TEXT_LIGHT),
     ))
     fig.update_layout(
-        title="Top-15 Feature Importances",
-        xaxis_title="Importance",
-        **_plotly_layout,
-    )
-    return fig
-
-
-def build_metrics_gauge(val_acc, val_f1, test_acc, test_f1) -> go.Figure:
-    fig = make_subplots(
-        rows=1, cols=4,
-        specs=[[{"type": "indicator"}] * 4],
-        subplot_titles=["Val Accuracy", "Val Macro-F1", "Test Accuracy", "Test Macro-F1"],
-    )
-    for col, (title, value) in enumerate([
-        ("Val Acc", val_acc), ("Val F1", val_f1),
-        ("Test Acc", test_acc), ("Test F1", test_f1),
-    ], start=1):
-        if isinstance(value, float):
-            fig.add_trace(
-                go.Indicator(
-                    mode="gauge+number",
-                    value=value,
-                    gauge=dict(
-                        axis=dict(range=[0, 1]),
-                        bar=dict(color=ACCENT_TEAL),
-                        bgcolor=CARD_BG,
-                        borderwidth=1,
-                        bordercolor=ACCENT_TEAL,
-                        steps=[
-                            dict(range=[0, 0.5], color="#1a2a3a"),
-                            dict(range=[0.5, 0.75], color="#1a3040"),
-                            dict(range=[0.75, 1], color="#1a3a50"),
-                        ],
-                    ),
-                    number=dict(font=dict(size=28, color=ACCENT_TEAL)),
-                ),
-                row=1, col=col,
-            )
-    fig.update_layout(height=240, **_plotly_layout)
-    return fig
-
-
-def build_class_dist_chart(class_dist: dict) -> go.Figure:
-    """Bar chart comparing train/val/test class counts."""
-    if not class_dist:
-        return go.Figure()
-    train = class_dist.get("train_smote", {})
-    classes = sorted(train.keys())
-    fig = go.Figure()
-    splits = [
-        ("train_smote", ACCENT_TEAL),
-        ("validation",  ACCENT_BLUE),
-        ("test",        WARNING),
-    ]
-    for key, color in splits:
-        counts = class_dist.get(key, {})
-        fig.add_trace(go.Bar(
-            name=key,
-            x=classes,
-            y=[counts.get(c, 0) for c in classes],
-            marker_color=color,
-        ))
-    fig.update_layout(
-        barmode="group",
-        title="Class Distribution across Splits",
-        xaxis_tickangle=-40,
-        **_plotly_layout,
+        title=f"Top-{len(classes)} Predicted Classes",
+        xaxis=dict(tickformat=".0%", range=[0, max(probs) * 1.25]),
+        **_layout,
     )
     return fig
 
 
 # ──────────────────────────────────────────────────────────────
-#  DOWNLOAD HELPERS
+#  MAIN PREDICT FUNCTION
 # ──────────────────────────────────────────────────────────────
-def _tmp_write(content: str, suffix: str) -> str:
-    """Write content to a named temp file and return the path."""
-    tf = tempfile.NamedTemporaryFile(
-        mode="w", suffix=suffix, delete=False, encoding="utf-8"
-    )
-    tf.write(content)
-    tf.flush()
-    return tf.name
+def predict(
+    chain_sequences, resolution, mol_weight,
+    density_matt, density_sol, ph_value,
+):
+    empty_fig = go.Figure().update_layout(**_layout)
 
-
-# ──────────────────────────────────────────────────────────────
-#  MAIN PIPELINE RUNNER  (called by Gradio)
-# ──────────────────────────────────────────────────────────────
-def run_classifier(csv_file, csv_path_str, openai_key, progress=gr.Progress()):
-    """
-    Entry point for the Gradio button click.
-    Yields a sequence of tuples that update every output component.
-    """
-
-    # ── 0. Resolve CSV path ───────────────────────────────────
-    if csv_file is not None:
-        csv_path = csv_file.name
-    elif csv_path_str and csv_path_str.strip():
-        csv_path = csv_path_str.strip()
-    else:
-        yield (
-            "❌ Please upload a CSV file or enter a file path.",
-            None, None, None, None,
-            "N/A", "N/A", "N/A", "N/A",
-            "", "", None, None, None,
+    if not MODEL_READY:
+        return (
+            f"❌ Model not loaded.\n\n{MODEL_ERROR}",
+            "", "", empty_fig,
         )
-        return
 
-    if not Path(csv_path).exists():
-        yield (
-            f"❌ File not found: {csv_path}",
-            None, None, None, None,
-            "N/A", "N/A", "N/A", "N/A",
-            "", "", None, None, None,
-        )
-        return
-
-    # ── 1. Set API key if provided ────────────────────────────
-    if openai_key and openai_key.strip():
-        os.environ["OPENAI_API_KEY"] = openai_key.strip()
-
-    if not os.environ.get("OPENAI_API_KEY"):
-        yield (
-            "❌ OPENAI_API_KEY is not set. Add it in the settings panel or your .env file.",
-            None, None, None, None,
-            "N/A", "N/A", "N/A", "N/A",
-            "", "", None, None, None,
-        )
-        return
-
-    # ── 2. Set up live logging via a thread-safe queue ────────
-    log_queue: queue.Queue = queue.Queue()
-    log_lines: list        = ["🚀 Pipeline started…"]
-    result_holder          = {}
-
-    def log_cb(msg: str):
-        log_queue.put(msg)
-
-    def pipeline_thread():
+    # Convert blank number inputs (Gradio sends None for empty)
+    def to_float(v):
         try:
-            final = run_pipeline(csv_path, log_callback=log_cb)
-            result_holder["state"] = final
+            return float(v) if v not in (None, "", "None") else None
         except Exception:
-            result_holder["error"] = traceback.format_exc()
-        finally:
-            log_queue.put("__DONE__")
+            return None
 
-    thread = threading.Thread(target=pipeline_thread, daemon=True)
-    thread.start()
+    resolution   = to_float(resolution)
+    mol_weight   = to_float(mol_weight)
+    density_matt = to_float(density_matt)
+    density_sol  = to_float(density_sol)
+    ph_value     = to_float(ph_value)
 
-    # ── 3. Stream log while pipeline runs ─────────────────────
-    empty_fig = go.Figure().update_layout(**_plotly_layout)
+    # Check at least something was provided
+    has_seq  = bool((chain_sequences or "").strip())
+    has_phys = any(v is not None for v in [resolution, mol_weight, density_matt, density_sol, ph_value])
 
-    while True:
-        try:
-            msg = log_queue.get(timeout=60)
-        except queue.Empty:
-            break
-        if msg == "__DONE__":
-            break
-        log_lines.append(msg)
-        yield (
-            "\n".join(log_lines),
-            empty_fig, empty_fig, empty_fig, empty_fig,
-            "…", "…", "…", "…",
-            "", "",
-            None, None, None,
+    if not has_seq and not has_phys:
+        return (
+            "⚠️ Please provide at least one input field to generate a prediction.",
+            "", "", empty_fig,
         )
 
-    thread.join(timeout=5)
+    # Build feature row
+    feature_df, filled, total_grp, provided_labels = build_feature_row(
+        chain_sequences, resolution, mol_weight, density_matt, density_sol, ph_value
+    )
+    pct = completeness_pct(filled, total_grp)
 
-    # ── 4. Handle errors ──────────────────────────────────────
-    if "error" in result_holder:
-        err_msg = f"❌ Pipeline failed:\n\n{result_holder['error']}"
-        log_lines.append(err_msg)
-        yield (
-            "\n".join(log_lines),
-            empty_fig, empty_fig, empty_fig, empty_fig,
-            "ERROR", "ERROR", "ERROR", "ERROR",
-            "", "",
-            None, None, None,
+    # Predict
+    proba       = MODEL.predict_proba(feature_df)[0]
+    top_idx     = np.argsort(proba)[::-1][:TOP_N_PRED]
+    top_classes = [LE.classes_[i] for i in top_idx]
+    top_probs   = [proba[i]       for i in top_idx]
+
+    top1_class = top_classes[0]
+    top1_prob  = top_probs[0]
+
+    # Confidence label
+    if top1_prob >= 0.60:
+        conf_label = "High"
+        conf_color = SUCCESS
+    elif top1_prob >= 0.35:
+        conf_label = "Medium"
+        conf_color = WARNING
+    else:
+        conf_label = "Low"
+        conf_color = "#FF6B6B"
+
+    # Completeness warning
+    warn = ""
+    if pct < 40:
+        warn = (
+            "\n\n⚠️  Low data completeness — prediction is based on limited features. "
+            "Providing chain_sequences and physicochemical values will improve accuracy."
         )
-        return
 
-    # ── 5. Unpack final state ─────────────────────────────────
-    state = result_holder["state"]
-
-    if state.get("error"):
-        log_lines.append(f"❌ {state['error']}")
-        yield (
-            "\n".join(log_lines),
-            empty_fig, empty_fig, empty_fig, empty_fig,
-            "ERROR", "ERROR", "ERROR", "ERROR",
-            "", "",
-            None, None, None,
-        )
-        return
-
-    # ── 6. Build charts ───────────────────────────────────────
-    fi_df   = state.get("feature_importance")
-    fi_chart = build_feature_importance_chart(fi_df) if fi_df is not None else empty_fig
-
-    val_acc  = state.get("val_accuracy",  "N/A")
-    val_f1   = state.get("val_f1",        "N/A")
-    test_acc = state.get("test_accuracy", "N/A")
-    test_f1  = state.get("test_f1",       "N/A")
-
-    gauges = build_metrics_gauge(
-        val_acc  if isinstance(val_acc,  float) else 0.0,
-        val_f1   if isinstance(val_f1,   float) else 0.0,
-        test_acc if isinstance(test_acc, float) else 0.0,
-        test_f1  if isinstance(test_f1,  float) else 0.0,
+    # Summary text
+    summary = (
+        f"🔬 PREDICTION RESULT\n"
+        f"{'─' * 40}\n"
+        f"  Top Class   : {top1_class}\n"
+        f"  Probability : {top1_prob:.1%}\n"
+        f"  Confidence  : {conf_label}\n"
+        f"{'─' * 40}\n"
+        f"  Data completeness : {pct}%\n"
+        f"  Inputs used       :\n"
+        + "\n".join(f"    • {l}" for l in provided_labels)
+        + warn
     )
 
-    # Class distribution from tool log
-    class_dist_chart = empty_fig
-    for entry in reversed(state.get("tool_call_log", [])):
-        if entry["tool"] == "inspect_class_distribution":
-            try:
-                class_dist_chart = build_class_dist_chart(json.loads(entry["result"]))
-            except Exception:
-                pass
-            break
+    # Runner-up table
+    runner_up_md = "| Rank | Class | Probability |\n|------|-------|-------------|\n"
+    for i, (cl, pr) in enumerate(zip(top_classes, top_probs), 1):
+        runner_up_md += f"| {i} | {cl} | {pr:.1%} |\n"
 
-    # ── 7. Text outputs ───────────────────────────────────────
-    val_report  = state.get("val_classification_report",  "Not available")
-    test_report = state.get("test_classification_report", "Not available")
-    summary     = state.get("summary", "No summary generated")
-    reasoning   = "\n\n".join(state.get("agent_reasoning", []))
+    chart = build_prediction_chart(list(reversed(top_classes)), list(reversed(top_probs)))
 
-    # ── 8. Downloadable files ─────────────────────────────────
-    report_path = _tmp_write(summary, "_protein_report.txt")
-
-    fi_csv_path = None
-    if fi_df is not None:
-        fi_csv_path = _tmp_write(fi_df.to_csv(index=False), "_feature_importance.csv")
-
-    tool_log_df = pd.DataFrame(state.get("tool_call_log", []))
-    tool_log_path = None
-    if not tool_log_df.empty:
-        tool_log_path = _tmp_write(tool_log_df.to_csv(index=False), "_tool_log.csv")
-
-    log_lines.append("✅ All done! Switch to the Results tabs.")
-
-    yield (
-        "\n".join(log_lines),         # agent_log
-        fi_chart,                      # fi_chart
-        gauges,                        # gauges_chart
-        class_dist_chart,              # dist_chart
-        empty_fig,                     # (reserved)
-        f"{val_acc}",                  # val_acc_txt
-        f"{val_f1}",                   # val_f1_txt
-        f"{test_acc}",                 # test_acc_txt
-        f"{test_f1}",                  # test_f1_txt
-        val_report,                    # val_report_txt
-        test_report,                   # test_report_txt
-        report_path,                   # dl_report
-        fi_csv_path,                   # dl_fi
-        tool_log_path,                 # dl_log
-    )
+    return summary, runner_up_md, f"{pct}%", chart
 
 
 # ──────────────────────────────────────────────────────────────
 #  GRADIO UI
 # ──────────────────────────────────────────────────────────────
 with gr.Blocks(
-    title="🧬 Agentic Protein Structure Classifier",
+    title="🧬 Protein Classifier — Prediction",
     css=CUSTOM_CSS,
     theme=gr.themes.Base(
         primary_hue="teal",
-        secondary_hue="blue",
         neutral_hue="slate",
         font=gr.themes.GoogleFont("IBM Plex Mono"),
     ),
 ) as demo:
 
     # ── Header ────────────────────────────────────────────────
-    gr.HTML("""
-    <div id="header-banner">
+    gr.HTML(f"""
+    <div id="header">
       <div style="position:relative;z-index:1;">
         <div style="display:flex;align-items:center;gap:1rem;margin-bottom:0.5rem;">
           <span style="font-size:2.2rem;">🧬</span>
           <div>
-            <h1 style="margin:0;font-size:1.6rem;color:#00D4B4;letter-spacing:0.05em;
-                        font-family:'IBM Plex Mono',monospace;font-weight:700;">
-              AGENTIC PROTEIN STRUCTURE CLASSIFIER
+            <h1 style="margin:0;font-size:1.55rem;color:{ACCENT_TEAL};
+                        font-family:'IBM Plex Mono',monospace;font-weight:700;
+                        letter-spacing:0.04em;">
+              PROTEIN STRUCTURE CLASSIFIER
             </h1>
-            <p style="margin:0.25rem 0 0 0;color:#7A9AB5;font-size:0.82rem;letter-spacing:0.1em;">
-              GPT-4o  ·  LangGraph  ·  Random Forest  ·  SMOTE  ·  PDB Dataset
+            <p style="margin:0.2rem 0 0;color:{TEXT_DIM};font-size:0.8rem;letter-spacing:0.1em;">
+              Random Forest · PDB Dataset · Agentic Training Pipeline
             </p>
           </div>
         </div>
-        <p style="margin:0.8rem 0 0 0;color:#B0CDD8;font-size:0.88rem;max-width:680px;line-height:1.6;">
-          Upload your PDB-derived CSV and watch the AI agent autonomously train,
-          evaluate, and interpret a Random Forest protein structure classifier —
-          reasoning step-by-step like an expert computational biologist.
+        <p style="margin:0.8rem 0 0;color:#B0CDD8;font-size:0.86rem;max-width:660px;line-height:1.65;">
+          Provide whatever protein data you have — nothing is required.
+          The more fields you fill in, the more accurate the prediction.
+          Chain sequences unlock 27 additional computed features automatically.
         </p>
+        {"" if MODEL_READY else f'<div style="margin-top:1rem;padding:0.8rem 1rem;background:#2a0a0a;border:1px solid #ff4444;border-radius:6px;color:#ff8888;font-size:0.8rem;">⚠️ Model not loaded — {MODEL_ERROR}</div>'}
       </div>
     </div>
     """)
 
-    # ── Input Panel ───────────────────────────────────────────
-    with gr.Row():
-        with gr.Column(scale=1, min_width=320):
-            gr.HTML('<div class="section-label">📁 Data Input</div>')
-            csv_upload = gr.File(
-                label="Upload CSV file",
-                file_types=[".csv"],
-                height=100,
-            )
-            csv_path_input = gr.Textbox(
-                label="— or — enter file path",
-                placeholder="/path/to/data_ai.csv",
+    with gr.Row(equal_height=False):
+
+        # ── LEFT: Input Panel ──────────────────────────────────
+        with gr.Column(scale=1, min_width=340):
+
+            gr.HTML('<div class="section-title">🧪 Sequence Data</div>')
+            chain_sequences = gr.Textbox(
+                label='chain_sequences  (dict format)',
+                placeholder='{"A": "MKTAYIAKQRQISFVK...", "B": "ACDEFGHIK..."}',
+                lines=4,
+                info="Paste the chain sequences dict. All 27 sequence features are computed automatically.",
             )
 
-            gr.HTML('<div class="section-label" style="margin-top:1rem;">🔑 API Key</div>')
-            api_key_input = gr.Textbox(
-                label="OpenAI API Key (overrides .env)",
-                placeholder="sk-…  (leave blank if set in .env)",
-                type="password",
+            gr.HTML('<div class="section-title">⚗️ Physicochemical Properties</div>')
+            gr.HTML(f'<p style="color:{TEXT_DIM};font-size:0.76rem;margin-bottom:0.6rem;">'
+                    f'All fields optional — leave blank if unknown.</p>')
+
+            resolution = gr.Number(
+                label="Resolution  (Å)",
+                value=None, minimum=0, maximum=10, step=0.01,
+                info="X-ray crystallography resolution",
+            )
+            mol_weight = gr.Number(
+                label="Structure Molecular Weight  (Da)",
+                value=None, minimum=0, step=100,
+                info="Molecular weight of the structure",
+            )
+            density_matt = gr.Number(
+                label="Density Matthews",
+                value=None, minimum=0, maximum=10, step=0.01,
+                info="Matthews coefficient (Å³/Da)",
+            )
+            density_sol = gr.Number(
+                label="Density Percent Solvent  (%)",
+                value=None, minimum=0, maximum=100, step=0.1,
+                info="Solvent content percentage",
+            )
+            ph_value = gr.Number(
+                label="pH Value",
+                value=None, minimum=0, maximum=14, step=0.1,
+                info="Crystallisation pH",
             )
 
-            gr.HTML("""
-            <div style="background:#0F2238;border:1px solid #00D4B455;border-radius:8px;
-                        padding:1rem;margin-top:1rem;font-size:0.78rem;color:#7A9AB5;line-height:1.7;">
-              <strong style="color:#00D4B4;">Required CSV columns:</strong><br>
-              &nbsp;• <code>classification</code> — target label<br>
-              &nbsp;• <code>chain_sequences</code> — dict of chain→sequence<br>
-              &nbsp;• <code>resolution</code><br>
-              &nbsp;• <code>structure_molecular_weight</code><br>
-              &nbsp;• <code>density_matthews</code><br>
-              &nbsp;• <code>density_percent_sol</code><br>
-              &nbsp;• <code>ph_value</code>
+            gr.HTML("<br>")
+            predict_btn = gr.Button("🔬  Predict Protein Class", elem_id="predict-btn")
+
+            gr.HTML(f"""
+            <div style="margin-top:1.2rem;background:{CARD_BG};border:1px solid {ACCENT_TEAL}33;
+                        border-radius:8px;padding:1rem;font-size:0.74rem;color:{TEXT_DIM};line-height:1.8;">
+              <strong style="color:{ACCENT_TEAL};">Feature groups used by model:</strong><br>
+              &nbsp;📐 Physicochemical (5 fields above)<br>
+              &nbsp;🧬 Sequence stats: num_chains, lengths, unique AA count<br>
+              &nbsp;🔤 AA frequencies: aa_freq_A … aa_freq_Y (20 features)<br>
+              <br>
+              <strong style="color:{ACCENT_TEAL};">Model:</strong> Random Forest · 500 trees<br>
+              <strong style="color:{ACCENT_TEAL};">Classes:</strong> Top-20 PDB protein types
             </div>
             """)
 
-            run_btn = gr.Button(
-                "▶  Run Classifier Agent",
-                elem_id="run-btn",
-            )
-
-        # ── Live Log ─────────────────────────────────────────
+        # ── RIGHT: Results Panel ───────────────────────────────
         with gr.Column(scale=2):
-            gr.HTML('<div class="section-label">🖥 Live Agent Log</div>')
-            agent_log = gr.Textbox(
-                label="",
-                elem_id="agent-log",
-                lines=28,
-                max_lines=28,
+
+            with gr.Row():
+                completeness_out = gr.Textbox(
+                    label="Data Completeness",
+                    value="—",
+                    interactive=False,
+                    scale=1,
+                )
+
+            summary_out = gr.Textbox(
+                label="Prediction Summary",
+                lines=12,
                 interactive=False,
-                placeholder="Pipeline output will stream here once you click Run…",
+                placeholder="Prediction will appear here after you click Predict…",
             )
 
-    gr.HTML("<hr style='border-color:#00D4B422;margin:1.5rem 0;'>")
+            with gr.Tabs():
+                with gr.Tab("📊 Probability Chart"):
+                    chart_out = gr.Plot(label="")
 
-    # ── Results Tabs ──────────────────────────────────────────
-    gr.HTML('<div class="section-label">📊 Results Dashboard</div>')
-
-    with gr.Tabs():
-
-        # ── Tab 1: Metric Gauges ──────────────────────────────
-        with gr.Tab("⚡ Metrics"):
-            gauges_chart = gr.Plot(label="Performance Gauges")
-            with gr.Row():
-                val_acc_txt  = gr.Textbox(label="Validation Accuracy",  interactive=False, value="—")
-                val_f1_txt   = gr.Textbox(label="Validation Macro-F1",  interactive=False, value="—")
-                test_acc_txt = gr.Textbox(label="Test Accuracy",         interactive=False, value="—")
-                test_f1_txt  = gr.Textbox(label="Test Macro-F1",         interactive=False, value="—")
-
-        # ── Tab 2: Feature Importance ─────────────────────────
-        with gr.Tab("📌 Feature Importance"):
-            fi_chart = gr.Plot(label="Top-15 Feature Importances")
-
-        # ── Tab 3: Class Distribution ─────────────────────────
-        with gr.Tab("📋 Class Distribution"):
-            dist_chart = gr.Plot(label="Class Counts per Split")
-
-        # ── Tab 4: Classification Reports ────────────────────
-        with gr.Tab("📄 Classification Reports"):
-            with gr.Row():
-                with gr.Column():
-                    gr.HTML('<div class="section-label">Validation Set</div>')
-                    val_report_txt = gr.Textbox(
-                        label="", lines=25, interactive=False,
-                        placeholder="Validation classification report will appear here…",
-                        elem_classes=["mono-text"],
+                with gr.Tab("📋 All Top Classes"):
+                    table_out = gr.Markdown(
+                        value="_Top-5 predictions will appear here…_"
                     )
-                with gr.Column():
-                    gr.HTML('<div class="section-label">Test Set</div>')
-                    test_report_txt = gr.Textbox(
-                        label="", lines=25, interactive=False,
-                        placeholder="Test classification report will appear here…",
-                        elem_classes=["mono-text"],
-                    )
-
-        # ── Tab 5: Downloads ──────────────────────────────────
-        with gr.Tab("⬇ Downloads"):
-            gr.HTML('<div style="color:#7A9AB5;margin-bottom:1rem;font-size:0.85rem;">'
-                    'Generated artefacts become available after the pipeline completes.'
-                    '</div>')
-            with gr.Row():
-                dl_report = gr.File(label="📝 Full Report (.txt)",     elem_id="dl-report-btn")
-                dl_fi     = gr.File(label="📊 Feature Importance (.csv)", elem_id="dl-fi-btn")
-                dl_log    = gr.File(label="🔧 Tool Call Log (.csv)",   elem_id="dl-log-btn")
 
     # ── Wire up ───────────────────────────────────────────────
-    # All outputs in the exact order yielded by run_classifier
-    outputs = [
-        agent_log,
-        fi_chart,
-        gauges_chart,
-        dist_chart,
-        gr.Plot(visible=False),   # reserved slot (keeps yield tuple length stable)
-        val_acc_txt,
-        val_f1_txt,
-        test_acc_txt,
-        test_f1_txt,
-        val_report_txt,
-        test_report_txt,
-        dl_report,
-        dl_fi,
-        dl_log,
-    ]
+    inputs  = [chain_sequences, resolution, mol_weight,
+               density_matt, density_sol, ph_value]
+    outputs = [summary_out, table_out, completeness_out, chart_out]
 
-    run_btn.click(
-        fn=run_classifier,
-        inputs=[csv_upload, csv_path_input, api_key_input],
-        outputs=outputs,
-    )
+    predict_btn.click(fn=predict, inputs=inputs, outputs=outputs)
+
+    # Also predict on Enter in the sequence box
+    chain_sequences.submit(fn=predict, inputs=inputs, outputs=outputs)
 
     # ── Footer ────────────────────────────────────────────────
-    gr.HTML("""
+    gr.HTML(f"""
     <div style="text-align:center;margin-top:2rem;padding-top:1rem;
-                border-top:1px solid #00D4B422;color:#3A5A6A;font-size:0.72rem;
-                letter-spacing:0.08em;">
-      AGENTIC PROTEIN STRUCTURE CLASSIFIER  ·  GPT-4o + LangGraph + Random Forest
+                border-top:1px solid {ACCENT_TEAL}22;
+                color:#3A5A6A;font-size:0.7rem;letter-spacing:0.08em;">
+      PROTEIN STRUCTURE CLASSIFIER  ·  Pre-trained Random Forest  ·  PDB Dataset
     </div>
     """)
 
 
-# ──────────────────────────────────────────────────────────────
-#  ENTRY POINT
 # ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     demo.launch(
         server_name="0.0.0.0",
         server_port=7860,
-        share=False,          # set True for a public Gradio tunnel link
+        share=True,
         show_error=True,
     )

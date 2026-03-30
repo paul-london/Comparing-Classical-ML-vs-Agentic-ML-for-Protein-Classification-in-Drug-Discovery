@@ -1,6 +1,10 @@
 *.csv
 *.pkl
 *.env
+*.joblib
+*.json
+Practice/
+images/
 
 
 # Byte-compiled / optimized / DLL files
