@@ -36,17 +36,17 @@ app.py         →  loads model/ → serves Gradio prediction UI
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │  LangGraph StateGraph  (agent_core.py)                          │
-│                                                                  │
-│  load_data                                                       │
-│      ↓                                                           │
+│                                                                 │
+│  load_data                                                      │
+│      ↓                                                          │
 │  filter_top_classes   (keep top-20 protein classes)             │
-│      ↓                                                           │
+│      ↓                                                          │
 │  feature_engineering  (5 physicochemical + 27 AA seq features)  │
-│      ↓                                                           │
+│      ↓                                                          │
 │  split_data           (80 / 10 / 10  stratified)                │
-│      ↓                                                           │
+│      ↓                                                          │
 │  apply_smote          (cap 6 000/class, k_neighbors=3)          │
-│      ↓                                                           │
+│      ↓                                                          │
 │  ┌──────────────────────────────────────────────────┐           │
 │  │  AGENT NODE  (GPT-4o + tool loop)                │           │
 │  │  ├─ train_random_forest()  → saves model/        │           │
@@ -56,8 +56,8 @@ app.py         →  loads model/ → serves Gradio prediction UI
 │  │  ├─ inspect_class_distribution()                 │           │
 │  │  └─ generate_final_report()  → saves reports     │           │
 │  └──────────────────────────────────────────────────┘           │
-│      ↓                                                           │
-│  END                                                             │
+│      ↓                                                          │
+│  END                                                            │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
